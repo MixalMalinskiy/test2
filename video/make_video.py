@@ -33,7 +33,8 @@ TOAD_TT = "7616371658462399760"     # vm.tiktok.com/ZGdCUHfw6 — жаба (1lox
 TOAD_T0, TOAD_T1 = 5.0, 6.7         # крупный план жабы с горшком золота, она говорит «Пять.»
 TOAD_IDLE = 10                      # первые кадры — жаба молчит
 BG_T = 1.3                          # кадр с пустой лесной тропинкой
-CAT_TEXT_BOX = (190, 725, 386, 772)  # «Thank you.» поверх кота (в кадре 576x1024)
+CAT_TEXT_BOXES = [(190, 725, 386, 772),   # «Thank you.» поверх кота (в кадре 576x1024)
+                  (60, 236, 215, 305)]    # водяной знак Vizard.ai
 GRID_FRONTALKA = (0, 1094, 541, 1448)
 GIRL_BOX = (0, 38, 350, 300)        # внутри панели «фронталка»
 FISH_BOX = (320, 30, 541, 300)
@@ -80,20 +81,42 @@ def decode_audio(path, t0=0.0, dur=None, af=None):
 _SESSION = None
 
 
-def cutout(rgb, keep_main=True):
-    """RGB -> RGBA без фона; keep_main выкидывает мелкие обрывки (водяные знаки)."""
+def cutout(rgb, main_only=True):
+    """RGB -> RGBA без фона (rembg)."""
     global _SESSION
     from rembg import new_session, remove
     if _SESSION is None:
         _SESSION = new_session("isnet-general-use")
     rgba = np.asarray(remove(Image.fromarray(rgb), session=_SESSION)).copy()
-    if keep_main:
-        n, lab, stats, _ = cv2.connectedComponentsWithStats((rgba[..., 3] > 40).astype(np.uint8))
-        if n > 1:
-            big = stats[1:, cv2.CC_STAT_AREA].max()
-            keep = [i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] > 0.15 * big]
-            rgba[..., 3] *= np.isin(lab, keep).astype(np.uint8)
+    return keep_main(rgba) if main_only else rgba
+
+
+def keep_main(rgba):
+    """Оставляет крупные куски альфы, выкидывает мелкие обрывки (водяные знаки)."""
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((rgba[..., 3] > 40).astype(np.uint8))
+    if n > 1:
+        big = stats[1:, cv2.CC_STAT_AREA].max()
+        keep = [i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] > 0.15 * big]
+        rgba[..., 3] *= np.isin(lab, keep).astype(np.uint8)
     return rgba
+
+
+def cat_cutout(rgb):
+    """Зелёный фон — быстрый хромакей; кадры со светлыми вспышками — через rembg."""
+    rgb = remove_cat_caption(rgb)
+    f = rgb.astype(float)
+    green = f[..., 1] - np.maximum(f[..., 0], f[..., 2])
+    border = np.concatenate([green[:8].ravel(), green[-8:].ravel(), green[:, :8].ravel(), green[:, -8:].ravel()])
+    if (border > 45).mean() < 0.95:
+        return cutout(rgb)
+    solid = keep_main(np.dstack([rgb, (green < 70).astype(np.uint8) * 255]))[..., 3] > 0
+    # заливаем дыры внутри силуэта (размытый в движении кот отливает зелёным)
+    flood = solid.astype(np.uint8)
+    cv2.floodFill(flood, np.zeros((flood.shape[0] + 2, flood.shape[1] + 2), np.uint8), (0, 0), 2)
+    inside = flood != 2
+    alpha = cv2.GaussianBlur(cv2.erode(inside.astype(np.float32), np.ones((3, 3))), (5, 5), 0)
+    g = np.minimum(f[..., 1], np.maximum(f[..., 0], f[..., 2]) + 8)       # без зелёного ореола
+    return np.dstack([f[..., 0], g, f[..., 2], alpha * 255]).clip(0, 255).astype(np.uint8)
 
 
 def to_sprite(rgba):
@@ -106,14 +129,14 @@ def to_sprite(rgba):
     return Image.fromarray(np.ascontiguousarray(rgba[y0:y1, x0:x1]), "RGBA"), (w / 2 - x0, h / 2 - y0)
 
 
-def cached_sequence(name, frames, prep=None):
+def cached_sequence(name, frames, cut=cutout):
     folder = asset(name)
     os.makedirs(folder, exist_ok=True)
     out = []
     for i, f in enumerate(frames):
         p = os.path.join(folder, f"{i:04d}.png")
         if not os.path.exists(p):
-            Image.fromarray(cutout(prep(f) if prep else f), "RGBA").save(p)
+            Image.fromarray(cut(f), "RGBA").save(p)
             if i % 30 == 0:
                 print(f"  {name}: {i}/{len(frames)}", flush=True)
         out.append(np.asarray(Image.open(p).convert("RGBA")))
@@ -121,12 +144,12 @@ def cached_sequence(name, frames, prep=None):
 
 
 def remove_cat_caption(rgb):
-    x0, y0, x1, y1 = CAT_TEXT_BOX
     img = np.ascontiguousarray(rgb)
     mask = np.zeros(img.shape[:2], np.uint8)
-    mask[y0:y1, x0:x1] = (img[y0:y1, x0:x1].min(2) > 190).astype(np.uint8) * 255
-    mask = cv2.dilate(mask, np.ones((7, 7), np.uint8))
-    return cv2.inpaint(img, mask, 7, cv2.INPAINT_TELEA)
+    for x0, y0, x1, y1 in CAT_TEXT_BOXES:
+        mask[y0:y1, x0:x1] = (img[y0:y1, x0:x1].min(2) > 190).astype(np.uint8) * 255
+    mask = cv2.dilate(mask, np.ones((13, 13), np.uint8))         # вместе с тёмной обводкой букв
+    return cv2.inpaint(img, mask, 9, cv2.INPAINT_TELEA)
 
 
 def make_background(toad_path):
@@ -152,7 +175,7 @@ def load_assets(grid_path):
     cat_path = fetch_tiktok(CAT_TT, "cat_tiktok.mp4")
     toad_path = fetch_tiktok(TOAD_TT, "toad_tiktok.mp4")
     print("cat frames...", flush=True)
-    cat = [to_sprite(f) for f in cached_sequence("cat", read_frames(cat_path, 0, DUR, FPS), remove_cat_caption)]
+    cat = [to_sprite(f) for f in cached_sequence("cat", read_frames(cat_path, 0, DUR, FPS), cat_cutout)]
     print("toad frames...", flush=True)
     toad = [to_sprite(f)[0] for f in cached_sequence("toad", read_frames(toad_path, TOAD_T0, TOAD_T1, FPS))]
     pan = Image.open(grid_path).convert("RGB").crop(GRID_FRONTALKA)
