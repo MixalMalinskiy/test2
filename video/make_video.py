@@ -1,12 +1,17 @@
 """УИИА-кот + рыба + Mr Jabec: генератор короткого мем-видео (14 c, 720x1280).
 
 Usage: python3 make_video.py <meme_grid.png> <out.mp4>
-Все персонажи рисуются кодом, звук синтезируется (numpy), сборка через ffmpeg.
+Требует: ffmpeg, pip install numpy pillow gTTS.
+Настоящий УИИА-кот (green screen, Tenor) и ремикс (MyInstants) скачиваются в
+video/assets/ при первом запуске; реплики рыбы и жабы озвучиваются через gTTS.
+Рыба и жаба рисуются кодом.
 """
 import math
+import os
 import random
 import subprocess
 import sys
+import urllib.request
 import wave
 
 import numpy as np
@@ -15,14 +20,36 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 W, H, FPS = 720, 1280, 30
 DUR = 14.0
 SR = 44100
-BPM = 128
-BEAT = 60 / BPM
-DROP = 1.5          # кот падает, начинается бит
+DROP = 1.5          # кот падает, начинается музыка
 BOOM = 7.0          # фронталка
 FONT = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 OUT_LINE = (25, 20, 20)
 
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+CAT_URL = "https://media.tenor.com/QB21w9GkiOoAAAP1/spincat.mp4"
+MUSIC_URL = "https://www.myinstants.com/media/sounds/oiia-cat-remix.mp3"
+CAT_FRAME = 0                             # кадр клипа, где кот стоит анфас
+MUSIC_LOOP_START = 6.13                   # с этой секунды в ремиксе начинается громкая часть
+
 random.seed(7)
+
+
+def fetch(url, name):
+    os.makedirs(ASSETS, exist_ok=True)
+    path = os.path.join(ASSETS, name)
+    if not os.path.exists(path):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(path, "wb") as f:
+            f.write(r.read())
+    return path
+
+
+def decode_audio(path, af=None):
+    cmd = ["ffmpeg", "-v", "error", "-i", path]
+    if af:
+        cmd += ["-af", af]
+    cmd += ["-f", "f32le", "-ac", "1", "-ar", str(SR), "-"]
+    return np.frombuffer(subprocess.run(cmd, check=True, capture_output=True).stdout, np.float32).astype(float)
 
 
 def font(size):
@@ -35,60 +62,23 @@ def aa(img, size):
 
 
 # --------------------------------------------------------------------------- sprites
-def draw_cat(front=True, mouth_open=False):
-    S = 2
-    im = Image.new("RGBA", (220 * S, 300 * S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(im)
-    o, lw = OUT_LINE, 5 * S
-    grey, dark, white, pink = (178, 178, 186), (120, 120, 130), (250, 250, 250), (255, 150, 170)
+def load_cat():
+    """Настоящий УИИА-кот: вырезаем зелёный фон; возвращает (анфас, зеркальный и чуть темнее — «спина»)."""
+    path = fetch(CAT_URL, "oiia_cat_greenscreen.mp4")
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                         check=True, capture_output=True).stdout
+    fr = np.frombuffer(raw, np.uint8).reshape(-1, 320, 320, 3).astype(float)
+    r, g, b = fr[..., 0], fr[..., 1], fr[..., 2]
+    green = g - np.maximum(r, b)
+    alpha = np.clip((90 - green) / 50, 0, 1)                   # мягкий край
+    g = np.minimum(g, np.maximum(r, b) + 10)                  # убираем зелёный ореол
+    rgba = np.stack([r, g, b, alpha * 255], -1).clip(0, 255).astype(np.uint8)
 
-    def e(box, fill):
-        d.ellipse([v * S for v in box], fill=fill, outline=o, width=lw)
-
-    def p(pts, fill, outline=o):
-        d.polygon([(x * S, y * S) for x, y in pts], fill=fill, outline=outline, width=lw if outline else 0)
-
-    # хвост
-    tx = 190 if front else 30
-    d.line([(tx * S, 270 * S), ((tx + (15 if front else -15)) * S, 210 * S), ((tx - (5 if front else -5)) * S, 170 * S)],
-           fill=o, width=22 * S, joint="curve")
-    d.line([(tx * S, 270 * S), ((tx + (15 if front else -15)) * S, 210 * S), ((tx - (5 if front else -5)) * S, 170 * S)],
-           fill=grey, width=13 * S, joint="curve")
-    # тело
-    e((55, 170, 165, 292), grey)
-    if front:
-        e((80, 200, 140, 285), white)
-    # лапки
-    e((60, 270, 100, 296), white if front else grey)
-    e((120, 270, 160, 296), white if front else grey)
-    # уши
-    p([(35, 80), (45, 8), (95, 50)], grey)
-    p([(185, 80), (175, 8), (125, 50)], grey)
-    if front:
-        p([(48, 66), (52, 25), (82, 50)], pink, None)
-        p([(172, 66), (168, 25), (138, 50)], pink, None)
-    # голова
-    e((22, 35, 198, 190), grey)
-    # полоски на лбу
-    for dx in (-22, 0, 22):
-        d.line([((110 + dx) * S, 42 * S), ((110 + dx * 0.8) * S, 68 * S)], fill=dark, width=6 * S)
-    if front:
-        e((70, 120, 150, 182), white)                         # мордочка
-        e((55, 80, 95, 128), (30, 30, 35))                    # глаза
-        e((125, 80, 165, 128), (30, 30, 35))
-        d.ellipse([62 * S, 88 * S, 76 * S, 102 * S], fill=white)
-        d.ellipse([132 * S, 88 * S, 146 * S, 102 * S], fill=white)
-        p([(102, 122), (118, 122), (110, 132)], pink, None)  # нос
-        if mouth_open:
-            e((92, 136, 128, 182), (60, 15, 25))
-            d.ellipse([100 * S, 160 * S, 120 * S, 180 * S], fill=pink)
-        else:
-            d.arc([92 * S, 126 * S, 112 * S, 146 * S], 20, 160, fill=o, width=4 * S)
-            d.arc([108 * S, 126 * S, 128 * S, 146 * S], 20, 160, fill=o, width=4 * S)
-        for y, dy in ((138, -8), (148, 0), (158, 8)):         # усы
-            d.line([(70 * S, y * S), (20 * S, (y + dy) * S)], fill=o, width=3 * S)
-            d.line([(150 * S, y * S), (200 * S, (y + dy) * S)], fill=o, width=3 * S)
-    return aa(im, (220, 300))
+    ys, xs = np.nonzero(alpha[CAT_FRAME] > 0.5)
+    front = Image.fromarray(rgba[CAT_FRAME], "RGBA").crop((xs.min() - 2, ys.min() - 2, xs.max() + 3, ys.max() + 3))
+    back = front.transpose(Image.FLIP_LEFT_RIGHT)
+    back = Image.merge("RGBA", [*(c.point(lambda v: int(v * 0.7)) for c in back.split()[:3]), back.getchannel("A")])
+    return front, back
 
 
 def draw_fish(mouth_open=False):
@@ -167,9 +157,7 @@ def draw_toad(mouth_open=False):
     return aa(im, (280, 250))
 
 
-CAT_F = draw_cat(True, False)
-CAT_FO = draw_cat(True, True)
-CAT_B = draw_cat(False)
+CAT_FRONT, CAT_BACK = load_cat()
 FISH = draw_fish(False)
 FISH_O = draw_fish(True)
 TOAD = draw_toad(False)
@@ -246,10 +234,11 @@ NAME_FISH = text_img("рыба", 30, fill=(255, 180, 70), stroke=4)
 NAME_TOAD = text_img("Mr Jabec", 30, fill=(140, 230, 90), stroke=4)
 
 
+PULSE = np.zeros(int(DUR * FPS) + 1)   # огибающая музыки по кадрам, заполняется в make_audio
+
+
 def beat_pulse(t):
-    if t < DROP or (BOOM <= t < BOOM + 0.6):
-        return 0.0
-    return math.exp(-((t - DROP) % BEAT) / 0.09)
+    return float(PULSE[min(len(PULSE) - 1, int(t * FPS))])
 
 
 def paste_c(frame, img, cx, cy, scale=1.0):
@@ -258,13 +247,13 @@ def paste_c(frame, img, cx, cy, scale=1.0):
     frame.alpha_composite(img, (round(cx - img.width / 2), round(cy - img.height / 2)))
 
 
-def spin_cat(frame, cx, cy, theta, scale, mouth):
+def spin_cat(frame, cx, cy, theta, scale):
+    """Кручение вокруг вертикальной оси, как в меме."""
     c = math.cos(theta)
-    spr = (CAT_FO if mouth else CAT_F) if c >= 0 else CAT_B
-    w = max(4, round(spr.width * scale * max(abs(c), 0.07)))
-    h = round(spr.height * scale)
-    img = spr.resize((w, h), Image.BILINEAR)
-    frame.alpha_composite(img, (round(cx - w / 2), round(cy - h / 2)))
+    spr = CAT_FRONT if c >= 0 else CAT_BACK
+    w = max(4, round(spr.width * scale * max(abs(c), 0.06)))
+    img = spr.resize((w, round(spr.height * scale)), Image.BILINEAR)
+    frame.alpha_composite(img, (round(cx - w / 2), round(cy - img.height / 2)))
 
 
 def render(fi):
@@ -301,20 +290,21 @@ def render(fi):
 
     # кот УИИА
     fx, fy = s["face"][0], PANEL_Y + s["face"][1]
-    speed = 9.0 if s["panel"] == "p9" else 5.0
-    if t >= DROP:
-        theta = (t - DROP) * speed * 2 * math.pi
-        mouth = ((t - DROP) // (BEAT / 2)) % 4 in (0, 3)
-        if t < DROP + 0.35:                       # падение сверху
+    if t < DROP:                                  # кот подглядывает из-за края
+        k = min(1, t / 0.6)
+        paste_c(frame, CAT_FRONT, W - 70, PANEL_Y + PANEL_H + 100 - 150 * k * k, 0.75)
+    else:
+        theta = (t - DROP) * (6.0 if s["panel"] == "p9" else 3.0) * 2 * math.pi
+        if t < DROP + 0.35:                       # прыжок в кадр
             k = (t - DROP) / 0.35
-            cx, cy, sc = fx + 170, -150 + (fy + 40 + 150) * k * k, 0.8
+            cx, cy, sc = W - 70 + (fx + 170 - W + 70) * k, PANEL_Y + PANEL_H - 50 - 300 * math.sin(k * math.pi), 0.9
         else:
             orb = (t - DROP - 0.35) * (2.6 if s["panel"] == "p9" else 1.2) * 2 * math.pi
             rx, ry = (250, 150)
             cx = min(W - 70, max(70, fx + rx * math.cos(orb)))
             cy = fy + 40 + ry * math.sin(orb)
-            sc = 0.9 + 0.2 * math.sin(orb)
-        spin_cat(frame, cx + sx, cy + sy, theta, sc * (1 + 0.12 * bp), mouth)
+            sc = 1.1 + 0.2 * math.sin(orb)
+        spin_cat(frame, cx + sx, cy + sy, theta, sc * (1 + 0.12 * bp))
         if t < BOOM or t > BOOM + 0.6:
             a = 0.5 + 0.5 * bp
             u = UIIA.copy()
@@ -366,24 +356,10 @@ def add(buf, sig, t):
         buf[i:j] += sig[: j - i]
 
 
-def kick():
-    n = int(0.35 * SR)
-    t = np.arange(n) / SR
-    f = 45 + 110 * np.exp(-t / 0.04)
-    return np.sin(2 * np.pi * np.cumsum(f) / SR) * env_ar(n, 0.002, 0.14)
-
-
 def hat():
     n = int(0.06 * SR)
     x = np.diff(np.random.randn(n + 1))
     return 0.25 * x * env_ar(n, 0.001, 0.015)
-
-
-def clap():
-    n = int(0.2 * SR)
-    x = np.diff(np.random.randn(n + 1)) * 0.5
-    e = env_ar(n, 0.001, 0.05)
-    return 0.5 * x * e
 
 
 def boom():
@@ -409,96 +385,93 @@ def croak():
     return 0.35 * saw * (0.5 + 0.5 * np.sign(np.sin(2 * np.pi * 22 * t))) * env_ar(n, 0.01, 0.2)
 
 
-VOWELS = {"u": (380, 900, 2500), "i": (330, 2700, 3400), "a": (900, 1400, 2900)}
+# озвучка: (индекс реплики в BUBBLES, текст, сдвиг высоты голоса)
+SPEECH = [
+    (0, "Тсс... она точно спит", 1.45),
+    (1, "Го доту? Я на миде!", 0.72),
+    (2, "Четыре утра, жаба!", 1.45),
+    (3, "Это фид. Минус двадцать пять эм эм эр.", 0.72),
+    (4, "Я всё равно красивее.", 1.45),
+    (5, "Катку после сериала?", 0.72),
+    (6, "Гэ гэ, вэ пэ!", 1.45),
+]
 
 
-def uiia_voice(total):
-    """Кошачье 'у-и-и-а' формантным синтезом поверх бита."""
-    keys = []          # (time, f0, vowel, amp)
-    t = DROP
-    while t < DUR - 0.3:
-        fast = BOOM + 0.6 <= t < 10.5
-        if BOOM <= t < BOOM + 0.6:
-            t = BOOM + 0.6
-            continue
-        step = BEAT / (4 if fast else 2)
-        up = 1.26 if fast else 1.0
-        for v, f0 in (("u", 560), ("i", 840), ("i", 840), ("a", 660)):
-            keys.append((t, f0 * up, v, 1.0))
-            keys.append((t + step * 0.8, f0 * up * (0.88 if v == "a" else 1.0), v, 0.9))
-            keys.append((t + step * 0.97, f0 * up, v, 0.15 if v == "i" else 0.6))
-            t += step
-    # финальное протяжное «А-а-а»
-    keys.append((DUR - 0.3, 700, "a", 1.0))
-    keys.append((DUR - 0.05, 420, "a", 0.0))
-    kt = np.array([k[0] for k in keys])
-    n = total
-    ts = np.arange(n) / SR
-    f0 = np.interp(ts, kt, [k[1] for k in keys])
-    amp = np.interp(ts, kt, [k[3] for k in keys])
-    amp[ts < DROP] = 0
-    amp[(ts >= BOOM) & (ts < BOOM + 0.6)] = 0
-    F = [np.interp(ts, kt, [VOWELS[k[2]][j] for k in keys]) for j in range(3)]
-    f0 = f0 * (1 + 0.012 * np.sin(2 * np.pi * 6 * ts))
-    ph = np.cumsum(f0) / SR
-    src = 2 * (ph % 1) - 1
-    src = src - 0.6 * np.concatenate([[0], src[:-1]])   # лёгкий high-shelf
-    out = np.zeros(n)
-    idx = np.nonzero(amp > 0)[0]
-    lo, hi = idx.min(), idx.max() + 1
-    for j, bw in enumerate((90, 140, 200)):
-        r = math.exp(-math.pi * bw / SR)
-        a1 = 2 * r * np.cos(2 * np.pi * F[j][lo:hi] / SR)
-        a2 = r * r
-        x = src[lo:hi].tolist()
-        a1l = a1.tolist()
-        y = [0.0] * len(x)
-        y1 = y2 = 0.0
-        g = 1 - r
-        for i in range(len(x)):
-            yi = g * x[i] + a1l[i] * y1 - a2 * y2
-            y[i] = yi
-            y2, y1 = y1, yi
-        out[lo:hi] += np.array(y) * (1.0, 0.6, 0.3)[j]
-    out *= np.convolve(amp, np.ones(200) / 200, mode="same")
-    return out / (np.abs(out).max() + 1e-9)
+def tts_line(text, pitch, window, name):
+    """gTTS + сдвиг высоты (рыба — писклявая, жаба — басом), ускоряем, чтобы влезло в окно реплики."""
+    from gtts import gTTS
+    path = os.path.join(ASSETS, name)
+    if not os.path.exists(path):
+        os.makedirs(ASSETS, exist_ok=True)
+        gTTS(text, lang="ru").save(path)
+    length = len(decode_audio(path)) / SR
+    tempo = min(2.2, max(1.15, length / window))
+    chain = [tempo / pitch]
+    while chain[-1] > 2.0:
+        chain = chain[:-1] + [2.0, chain[-1] / 2.0]
+    af = f"asetrate={round(24000 * pitch)},aresample={SR}," + ",".join(f"atempo={c:.4f}" for c in chain)
+    return decode_audio(path, af)
 
 
 def make_audio(path):
     np.random.seed(3)
     n = int(DUR * SR)
-    drums = np.zeros(n)
     sfx = np.zeros(n)
+    voice = np.zeros(n)
+    duck = np.ones(n)
+
+    # музыка: зацикленный ремикс УИИА с дропа, тишина на «бум» фронталки
+    remix = decode_audio(fetch(MUSIC_URL, "oiia_cat_remix.mp3"))
+    loop = remix[int(MUSIC_LOOP_START * SR):]
+    music = np.zeros(n)
     t = DROP
-    b = 0
-    while t < DUR - 0.2:
-        if not (BOOM <= t < BOOM + 0.6):
-            add(drums, kick(), t)
-            add(drums, hat(), t + BEAT / 2)
-            if b % 2 == 1:
-                add(drums, clap(), t)
-        t += BEAT
-        b += 1
+    while t < DUR:
+        add(music, loop, t)
+        t += len(loop) / SR
+    i0, i1 = int(BOOM * SR), int((BOOM + 0.6) * SR)
+    music[i0:i1] = 0
+    ramp = int(0.05 * SR)
+    music[i1:i1 + ramp] *= np.linspace(0, 1, ramp)
+
+    # реплики рыбы и жабы
+    for bi, text, pitch in SPEECH:
+        b0, b1 = BUBBLES[bi][0], BUBBLES[bi][1]
+        line = tts_line(text, pitch, b1 - b0 - 0.15, f"tts_{bi}.mp3")
+        add(voice, line / (np.abs(line).max() + 1e-9), b0 + 0.05)
+        duck[int(b0 * SR):int((b0 + 0.05) * SR) + len(line)] = 0.4
+    duck = np.convolve(duck, np.ones(2000) / 2000, mode="same")
+
     # тихое тиканье часов до дропа
     for k in range(3):
         add(sfx, 0.15 * hat(), 0.2 + k * 0.45)
     add(sfx, boing(), DROP)
-    add(sfx, croak(), 3.6)
-    add(sfx, croak(), 7.65)
+    add(sfx, croak(), 3.55)
     add(sfx, boom(), BOOM)
     for x in SCENES[1:]:
         add(sfx, 0.4 * np.random.randn(int(0.12 * SR)) * env_ar(int(0.12 * SR), 0.001, 0.04), x["t0"])
-    voice = uiia_voice(n)
-    mix = 0.55 * drums + 0.5 * voice + 0.6 * sfx
+
+    music *= 0.8 / (np.abs(music).max() + 1e-9)
+    mix = music * duck + 0.75 * voice + 0.6 * sfx
     fade = np.ones(n)
     fade[-int(0.3 * SR):] = np.linspace(1, 0, int(0.3 * SR))
-    mix = np.tanh(1.3 * mix * fade) * 0.9
+    mix = np.tanh(1.2 * mix * fade) * 0.9
     pcm = (mix * 32767).astype(np.int16)
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(SR)
         w.writeframes(pcm.tobytes())
+
+    # пульс для анимации — по атакам музыки
+    hop = SR // FPS
+    rms = np.array([np.sqrt(np.mean(music[k * hop:(k + 1) * hop] ** 2)) if k * hop < n else 0.0
+                    for k in range(len(PULSE))])
+    onset = np.maximum(0, np.diff(rms, prepend=0))
+    onset /= np.percentile(onset[onset > 0], 95) + 1e-9
+    p = 0.0
+    for k in range(len(PULSE)):
+        p = max(min(1.0, onset[k]), p * 0.72)
+        PULSE[k] = p
 
 
 def main():
