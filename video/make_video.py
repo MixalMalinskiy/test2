@@ -254,12 +254,34 @@ def load_assets(grid_path):
 _XTTS = None
 
 
+CLONE_TAKES = 4             # дублей на каждую новую фразу; берём лучший
+
+
+def voice_embedding(paths):
+    _, e = _XTTS.synthesizer.tts_model.get_conditioning_latents(audio_path=paths)
+    e = e.flatten().numpy()
+    return e / np.linalg.norm(e)
+
+
+def median_pitch(y):
+    import librosa
+    f0 = librosa.yin(y, fmin=70, fmax=700, sr=SR)
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0][:len(f0)]
+    voiced = f0[:len(rms)][rms > 0.3 * rms.max()]
+    return float(np.median(voiced)) if len(voiced) else 0.0
+
+
 def clone_line(text, who):
-    """Новая фраза голосом персонажа: XTTS v2 по образцам его родного голоса (с кэшем)."""
+    """Новая фраза голосом персонажа: XTTS v2 по образцам его родного голоса (с кэшем).
+
+    Делаем CLONE_TAKES дублей и берём тот, что ближе к родному голосу и разборчивее
+    (whisper сверяет текст), затем подгоняем высоту голоса под его родные фразы.
+    """
     global _XTTS
+    import difflib
     import hashlib
     speed = VOICE_SPEED[who]
-    path = asset(f"clone_{who}_{hashlib.md5(f'{text}|{speed}'.encode()).hexdigest()[:10]}.wav")
+    path = asset(f"clone_{who}_{hashlib.md5(f'{text}|{speed}|{CLONE_TAKES}'.encode()).hexdigest()[:10]}.wav")
     if not os.path.exists(path):
         refs = []
         for i, (vid, a, b) in enumerate(VOICE_REFS[who]):
@@ -272,8 +294,40 @@ def clone_line(text, who):
             os.environ.setdefault("COQUI_TOS_AGREED", "1")
             from TTS.api import TTS
             _XTTS = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
-        print(f"  voice {who}: {text}", flush=True)
-        _XTTS.tts_to_file(text=text, speaker_wav=refs, language="ru", speed=speed, file_path=path)
+        import torch
+        from faster_whisper import WhisperModel
+        whisper = WhisperModel("small", device="cpu", compute_type="int8")
+        ref_emb = voice_embedding(refs)
+        norm = lambda x: "".join(c for c in x.lower().replace("ё", "е") if c.isalnum())  # noqa: E731
+        best = None
+        for take in range(CLONE_TAKES):
+            tmp = path.replace(".wav", f"_take{take}.wav")
+            torch.manual_seed(take)
+            print(f"  voice {who} #{take}: {text}", flush=True)
+            _XTTS.tts_to_file(text=text, speaker_wav=refs, language="ru", speed=speed, file_path=tmp)
+            pcm16k = np.frombuffer(subprocess.run(["ffmpeg", "-v", "error", "-i", tmp, "-f", "f32le", "-ac", "1",
+                                                   "-ar", "16000", "-"], check=True, capture_output=True).stdout, np.float32)
+            heard = " ".join(seg.text for seg in whisper.transcribe(pcm16k, language="ru")[0])
+            clarity = difflib.SequenceMatcher(None, norm(text), norm(heard)).ratio()
+            score = float(voice_embedding([tmp]) @ ref_emb) + clarity
+            print(f"    похожесть+разборчивость {score:.2f}: «{heard.strip()}»", flush=True)
+            if best is None or score > best[0]:
+                best = (score, tmp)
+        y = decode_audio(best[1])
+        ref_f0 = median_pitch(np.concatenate([decode_audio(r) for r in refs]))
+        f0 = median_pitch(y)
+        if ref_f0 and f0:
+            import librosa
+            steps = float(np.clip(12 * np.log2(ref_f0 / f0), -4, 4))
+            if abs(steps) > 0.5:
+                y = librosa.effects.pitch_shift(y, sr=SR, n_steps=steps)
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SR)
+            w.writeframes((np.clip(y / (np.abs(y).max() + 1e-9), -1, 1) * 32767 * 0.95).astype(np.int16).tobytes())
+        for take in range(CLONE_TAKES):
+            os.remove(path.replace(".wav", f"_take{take}.wav"))
     a = decode_audio(path)
     loud = np.nonzero(np.abs(a) > 0.03 * np.abs(a).max())[0]   # срезаем тишину по краям
     return a[max(0, loud[0] - int(0.05 * SR)):loud[-1] + int(0.08 * SR)]
