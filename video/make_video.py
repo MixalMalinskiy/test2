@@ -1,9 +1,10 @@
 """Коля (Mr Jabec) впервые видит её фронталку: УИИА-кот, рыба и жаба — ~18 c, 720x1280.
 
 Usage: python3 make_video.py <meme_grid.png> <out.mp4>
-Требует: ffmpeg, pip install numpy pillow opencv-python-headless "rembg[cpu]" coqui-tts,
-torch/torchaudio 2.8 (CPU). Новые реплики озвучиваются клоном родных голосов (XTTS v2,
-COQUI_TOS_AGREED=1).
+Требует: ffmpeg, pip install numpy pillow opencv-python-headless "rembg[cpu]" f5-tts speechbrain
+faster-whisper, torch/torchaudio 2.8 (CPU). Новые реплики озвучиваются клоном родных голосов:
+F5-TTS (русская модель Misha24-10/F5-TTS_RUSSIAN, «+» перед ударной гласной), лучший дубль
+выбирается по похожести голоса (ECAPA) и разборчивости (whisper).
 
 Всё берётся из оригиналов, 1 в 1:
   * кот и звук — TikTok «uia original cat» (green screen), фон вырезается rembg;
@@ -58,12 +59,16 @@ SHOTS = {
 PREVIEW = (300, 270)        # окно превью камеры на экране телефона
 FISH_TT = "7688388792935501063"     # 1loxxy: «Коля, ты что, не можешь говорить?» — голос Ларго
 SONG_TT = "7690632407040494856"     # 1loxxy: Коля поёт «Твої очі — ліхтарики…»
-# образцы голосов для клона: (ролик, начало, конец)
+# образцы голосов для клона: (ролик, начало, конец, что сказано — с ударениями для F5)
 VOICE_REFS = {
-    "toad": [(TOAD_TT, 0.0, 2.25), (TOAD_TT, 5.15, 5.75)],
-    "fish": [(TOAD_TT, 2.3, 4.65), (TOAD_TT, 6.25, 10.2), (FISH_TT, 0.0, 2.45), (FISH_TT, 3.2, 4.55)],
+    "toad": [(TOAD_TT, 0.0, 2.25, "А что +если он+и не зах+отят скид+ываться?"), (TOAD_TT, 5.15, 5.75, "П+ять.")],
+    "fish": [(TOAD_TT, 2.3, 4.65, "К+оля, у теб+я по матем+атике ск+олько б+ыло?"),
+             (FISH_TT, 0.0, 2.45, "К+оля, ты чт+о, не м+ожешь говор+ить?"),
+             (FISH_TT, 3.2, 4.55, "Сл+ава Б+огу!")],
 }
-VOICE_SPEED = {"toad": 1.5, "fish": 1.2}
+VOICE_SPEED = {"toad": 1.0, "fish": 1.0}
+F5_REPO = "https://huggingface.co/Misha24-10/F5-TTS_RUSSIAN/resolve/main/"
+F5_FILES = {"ckpt": "F5TTS_v1_Base_v4_winter/model_212000.safetensors", "vocab": "F5TTS_v1_Base/vocab.txt"}
 
 
 def asset(name):
@@ -251,83 +256,85 @@ def load_assets(grid_path):
 
 
 # --------------------------------------------------------------------------- голоса и расписание
-_XTTS = None
+CLONE_TAKES = 3             # дублей на каждую новую фразу; берём лучший
+_VOICE = {}                 # лениво загружаемые модели: f5, ecapa, whisper
 
 
-CLONE_TAKES = 4             # дублей на каждую новую фразу; берём лучший
+def voice_models():
+    if not _VOICE:
+        from f5_tts.api import F5TTS
+        from faster_whisper import WhisperModel
+        from speechbrain.inference.speaker import EncoderClassifier
+        files = {}
+        for key, rel in F5_FILES.items():
+            path = os.path.join(os.path.expanduser("~/.cache/f5ru"), os.path.basename(rel))
+            if not os.path.exists(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                urllib.request.urlretrieve(F5_REPO + rel, path)
+            files[key] = path
+        _VOICE["f5"] = F5TTS(model="F5TTS_v1_Base", ckpt_file=files["ckpt"], vocab_file=files["vocab"], device="cpu")
+        _VOICE["ecapa"] = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
+                                                         savedir=os.path.expanduser("~/.cache/ecapa"),
+                                                         run_opts={"device": "cpu"})
+        _VOICE["whisper"] = WhisperModel("small", device="cpu", compute_type="int8")
+    return _VOICE
 
 
-def voice_embedding(paths):
-    _, e = _XTTS.synthesizer.tts_model.get_conditioning_latents(audio_path=paths)
-    e = e.flatten().numpy()
-    return e / np.linalg.norm(e)
+def pcm16k(path):
+    return np.frombuffer(subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-f", "f32le", "-ac", "1", "-ar", "16000",
+                                         "-"], check=True, capture_output=True).stdout, np.float32)
 
 
-def median_pitch(y):
-    import librosa
-    f0 = librosa.yin(y, fmin=70, fmax=700, sr=SR)
-    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0][:len(f0)]
-    voiced = f0[:len(rms)][rms > 0.3 * rms.max()]
-    return float(np.median(voiced)) if len(voiced) else 0.0
+def speaker_vec(path):
+    import torch
+    e = voice_models()["ecapa"].encode_batch(torch.tensor(pcm16k(path))[None]).squeeze()
+    return (e / e.norm()).numpy()
 
 
 def clone_line(text, who):
-    """Новая фраза голосом персонажа: XTTS v2 по образцам его родного голоса (с кэшем).
+    """Новая фраза голосом персонажа: F5-TTS по образцу его родного голоса (с кэшем).
 
-    Делаем CLONE_TAKES дублей и берём тот, что ближе к родному голосу и разборчивее
-    (whisper сверяет текст), затем подгоняем высоту голоса под его родные фразы.
+    Делаем CLONE_TAKES дублей и берём тот, что ближе к родному голосу (ECAPA) и разборчивее
+    (whisper сверяет текст). В text «+» стоит перед ударной гласной.
     """
-    global _XTTS
     import difflib
     import hashlib
     speed = VOICE_SPEED[who]
-    path = asset(f"clone_{who}_{hashlib.md5(f'{text}|{speed}|{CLONE_TAKES}'.encode()).hexdigest()[:10]}.wav")
+    path = asset(f"f5_{who}_{hashlib.md5(f'{text}|{speed}|{CLONE_TAKES}'.encode()).hexdigest()[:10]}.wav")
     if not os.path.exists(path):
-        refs = []
-        for i, (vid, a, b) in enumerate(VOICE_REFS[who]):
-            ref = asset(f"ref_{who}_{i}.wav")
-            if not os.path.exists(ref):
-                subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(a), "-t", str(b - a), "-i", fetch_tiktok(vid),
-                                "-ac", "1", "-ar", "24000", ref], check=True)
-            refs.append(ref)
-        if _XTTS is None:
-            os.environ.setdefault("COQUI_TOS_AGREED", "1")
-            from TTS.api import TTS
-            _XTTS = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
-        import torch
-        from faster_whisper import WhisperModel
-        whisper = WhisperModel("small", device="cpu", compute_type="int8")
-        ref_emb = voice_embedding(refs)
+        ref = asset(f"f5ref_{who}.wav")
+        if not os.path.exists(ref):                         # родные фразы подряд — один образец
+            parts = []
+            for i, (vid, a, b, _) in enumerate(VOICE_REFS[who]):
+                part = asset(f"f5ref_{who}_{i}.wav")
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(a), "-t", str(b - a), "-i",
+                                fetch_tiktok(vid), "-ac", "1", "-ar", "24000", "-af", "apad=pad_dur=0.2", part],
+                               check=True)
+                parts.append(part)
+            inputs = sum((["-i", q] for q in parts), [])
+            subprocess.run(["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex",
+                            "".join(f"[{i}]" for i in range(len(parts))) + f"concat=n={len(parts)}:v=0:a=1",
+                            ref], check=True)
+        ref_text = " ".join(r[3] for r in VOICE_REFS[who])
+        m = voice_models()
+        target = speaker_vec(ref)
         norm = lambda x: "".join(c for c in x.lower().replace("ё", "е") if c.isalnum())  # noqa: E731
         best = None
         for take in range(CLONE_TAKES):
             tmp = path.replace(".wav", f"_take{take}.wav")
-            torch.manual_seed(take)
             print(f"  voice {who} #{take}: {text}", flush=True)
-            _XTTS.tts_to_file(text=text, speaker_wav=refs, language="ru", speed=speed, file_path=tmp)
-            pcm16k = np.frombuffer(subprocess.run(["ffmpeg", "-v", "error", "-i", tmp, "-f", "f32le", "-ac", "1",
-                                                   "-ar", "16000", "-"], check=True, capture_output=True).stdout, np.float32)
-            heard = " ".join(seg.text for seg in whisper.transcribe(pcm16k, language="ru")[0])
+            m["f5"].infer(ref_file=ref, ref_text=ref_text, gen_text=text, file_wave=tmp, nfe_step=32,
+                          speed=speed, seed=take, show_info=lambda *a, **k: None)
+            heard = " ".join(seg.text for seg in m["whisper"].transcribe(pcm16k(tmp), language="ru")[0])
             clarity = difflib.SequenceMatcher(None, norm(text), norm(heard)).ratio()
-            score = float(voice_embedding([tmp]) @ ref_emb) + clarity
+            score = float(speaker_vec(tmp) @ target) + clarity
             print(f"    похожесть+разборчивость {score:.2f}: «{heard.strip()}»", flush=True)
             if best is None or score > best[0]:
                 best = (score, tmp)
-        y = decode_audio(best[1])
-        ref_f0 = median_pitch(np.concatenate([decode_audio(r) for r in refs]))
-        f0 = median_pitch(y)
-        if ref_f0 and f0:
-            import librosa
-            steps = float(np.clip(12 * np.log2(ref_f0 / f0), -4, 4))
-            if abs(steps) > 0.5:
-                y = librosa.effects.pitch_shift(y, sr=SR, n_steps=steps)
-        with wave.open(path, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(SR)
-            w.writeframes((np.clip(y / (np.abs(y).max() + 1e-9), -1, 1) * 32767 * 0.95).astype(np.int16).tobytes())
+        os.replace(best[1], path)
         for take in range(CLONE_TAKES):
-            os.remove(path.replace(".wav", f"_take{take}.wav"))
+            if os.path.exists(path.replace(".wav", f"_take{take}.wav")):
+                os.remove(path.replace(".wav", f"_take{take}.wav"))
     a = decode_audio(path)
     loud = np.nonzero(np.abs(a) > 0.03 * np.abs(a).max())[0]   # срезаем тишину по краям
     return a[max(0, loud[0] - int(0.05 * SR)):loud[-1] + int(0.08 * SR)]
@@ -438,9 +445,9 @@ LINES = [
     dict(who="toad", src=(SONG_TT, 4.20, 8.65), gap=0.1, shot=("mask", 2.4),
          bubble="твої очі — ліхтарики,\nпогляд — п’ять зірок, шок"),
     dict(who="fish", src=(FISH_TT, 3.20, 4.55), gap=0.1, bubble="Слава Богу!"),
-    dict(who="fish", say="Коля, она ночью съела весь торт.", gap=0.25, shot="fridge",
+    dict(who="fish", say="К+оля, он+а н+очью с+ъела весь т+орт.", gap=0.25, shot="fridge",
          bubble="Коля, она ночью\nсъела весь торт"),
-    dict(who="toad", say="Ква! Значит, это любовь!", gap=0.15, bubble="ква! значит, это любовь"),
+    dict(who="toad", say="Кв+а! Зн+ачит, +это люб+овь!", gap=0.15, bubble="ква! значит, это любовь"),
 ]
 LOVE_AT = TOAD_SYNC = 0.0   # считаются в build_schedule()
 PHONE_C = (360, 520)
