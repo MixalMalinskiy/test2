@@ -1,13 +1,14 @@
-"""УИИА-кот крутится вокруг телефона с её фронталкой, рыба и Mr Jabec решают «проблему» — 15 c, 720x1280.
+"""Коля (Mr Jabec) впервые видит её фронталку: УИИА-кот, рыба и жаба — 14 c, 720x1280.
 
 Usage: python3 make_video.py <meme_grid.png> <out.mp4>
 Требует: ffmpeg, pip install numpy pillow opencv-python-headless "rembg[cpu]".
 
 Всё берётся из оригиналов, 1 в 1:
   * кот и звук — TikTok «uia original cat» (green screen), фон вырезается rembg;
-  * мелкая жаба Mr Jabec, весь диалог (родные голоса) и фон-лес — TikTok 1loxxy;
-    реплики второго персонажа из того ролика отданы рыбе;
-  * концовка — жаба поёт «Only a genius could love a woman» (TikTok 1loxxy «Только Коля мог полюбить…»);
+  * мелкая жаба Mr Jabec и фон-лес — TikTok 1loxxy;
+  * диалог собран из фраз разных роликов 1loxxy родными голосами (см. LINES);
+    голос Ларго отдан рыбе;
+  * концовка — жаба поёт «Only a genius could love a woman» (1loxxy «Только Коля мог полюбить…»);
   * её фронталка (на экране телефона) и рыба — из присланной картинки.
 Видео качаются через tikwm.com; вырезки кэшируются в video/assets/.
 """
@@ -24,7 +25,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 W, H, FPS = 720, 1280, 30
-DUR = 15.0
+DUR = 14.2
 SR = 44100
 FONT = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 SYMBOL_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"   # для ❤
@@ -50,8 +51,11 @@ def asset(name):
     return os.path.join(ASSETS, name)
 
 
-def fetch_tiktok(video_id, name):
-    path = asset(name)
+CACHED_NAMES = {CAT_TT: "cat_tiktok.mp4", TOAD_TT: "toad_tiktok.mp4", LOVE_TT: "love_tiktok.mp4"}
+
+
+def fetch_tiktok(video_id, name=None):
+    path = asset(name or CACHED_NAMES.get(video_id, f"tt_{video_id}.mp4"))
     if os.path.exists(path):
         return path
     api = f"https://www.tikwm.com/api/?hd=1&url=https://www.tiktok.com/@x/video/{video_id}"
@@ -187,13 +191,13 @@ def make_background(toad_path):
 
 
 def load_assets(grid_path):
-    cat_path = fetch_tiktok(CAT_TT, "cat_tiktok.mp4")
-    toad_path = fetch_tiktok(TOAD_TT, "toad_tiktok.mp4")
+    cat_path = fetch_tiktok(CAT_TT)
+    toad_path = fetch_tiktok(TOAD_TT)
     print("cat frames...", flush=True)
     cat = [to_sprite(f) for f in cached_sequence("cat", read_frames(cat_path, 0, DUR, FPS), cat_cutout)]
     print("toad frames...", flush=True)
     toad = [to_sprite(f)[0] for f in cached_sequence("toad", read_frames(toad_path, TOAD_T0, TOAD_T1, FPS))]
-    love_path = fetch_tiktok(LOVE_TT, "love_tiktok.mp4")
+    love_path = fetch_tiktok(LOVE_TT)
     love = [Image.fromarray(f, "RGBA") for f in
             cached_sequence("love", read_frames(love_path, LOVE_T0, LOVE_T1, FPS), love_cutout)]
     pan = Image.open(grid_path).convert("RGB").crop(GRID_FRONTALKA)
@@ -274,24 +278,25 @@ def paste_c(frame, img, cx, cy, scale=1.0, angle=0.0):
     frame.alpha_composite(img, (round(cx - img.width / 2), round(cy - img.height / 2)))
 
 
-CAPTION = "Сбор ей на новый телефон\nпосле этой фронталки"
-DIALOG_AT = 1.0           # с этой секунды идёт диалог из TikTok с жабой (до этого — чистый УИИА)
-LOVE_AT = 11.3            # концовка: жаба поёт, «только гений мог полюбить такую, как она»
+CAPTION = "Коля впервые увидел\nеё фронталку"
+LOVE_AT = 10.6            # концовка: жаба поёт, «только гений мог полюбить такую, как она»
 LOVE_CAPTION = "Только гений мог полюбить\nтакую, как она"
-# реплики в секундах ролика с жабой (разметка whisper): кто, начало, конец, пузырь
+# диалог из фраз разных роликов 1loxxy (разметка whisper):
+# кто, id ролика, начало и конец фразы в нём, когда звучит у нас, пузырь
 LINES = [
-    ("toad", 0.00, 2.25, "а что если они\nне захотят скидываться?"),
-    ("fish", 2.30, 4.65, "Коля, у тебя по математике\nсколько было?"),
-    ("toad", 5.15, 5.90, "пять."),
-    ("fish", 6.25, 10.20, "вот можешь пить, можешь\nпо трезвому, только пойди\nи реши эту проблему"),
+    ("fish", "7688388792935501063", 0.00, 2.45, 1.3, "Коля, ты что,\nне можешь говорить?"),
+    ("toad", TOAD_TT, 5.15, 5.75, 3.85, "пять."),
+    ("toad", "7690632407040494856", 4.20, 8.65, 4.6, "твои глаза — фонарики,\nвзгляд — пять звёзд, шок"),
+    ("fish", "7688388792935501063", 3.20, 4.55, 9.2, "Слава Богу!"),
 ]
+TOAD_SYNC = 3.85 - (5.15 - TOAD_T0)   # кадры жабы 1 в 1 с её «Пять.»
 PHONE_C = (360, 520)
 FISH_C = (160, 1010)
 TOAD_C = (545, 990)
 
 
 def speaking(t, who):
-    return any(w == who and DIALOG_AT + a <= t < DIALOG_AT + b for w, a, b, _ in LINES)
+    return any(w == who and at <= t < at + (b - a) for w, _, a, b, at, _ in LINES)
 
 
 def render(fi, A, pulse, voice_env, layers):
@@ -322,9 +327,8 @@ def render(fi, A, pulse, voice_env, layers):
     ve = voice_env[min(len(voice_env) - 1, fi)] if speaking(t, "fish") else 0.0
     paste_c(frame, A["fish"], FISH_C[0], FISH_C[1] + 10 * math.sin(t * 3.1), 1.2 * (1 + 0.22 * ve + 0.04 * bp))
     frames = A["toad"]
-    sync = DIALOG_AT + TOAD_T0                             # «Пять.» — кадры 1 в 1 с голосом
-    if sync <= t < sync + len(frames) / FPS:
-        toad = frames[int((t - sync) * FPS)]
+    if TOAD_SYNC <= t < TOAD_SYNC + len(frames) / FPS and not speaking(t, "fish"):  # «Пять.» 1 в 1
+        toad = frames[int((t - TOAD_SYNC) * FPS)]
     else:                                                  # туда-обратно, без скачка
         n = len(frames) if speaking(t, "toad") else TOAD_IDLE
         k = int(t * FPS) % (2 * n - 2)
@@ -346,8 +350,8 @@ def render(fi, A, pulse, voice_env, layers):
         frame.alpha_composite(A["love"][min(len(A["love"]) - 1, int(lt * FPS))].resize((W, H), Image.BILINEAR),
                               (0, round(rise)))
 
-    for (who, a, b, _), img in zip(LINES, layers["bubbles"]):
-        b0, b1 = DIALOG_AT + a, min(LOVE_AT, DIALOG_AT + b + 0.35)
+    for (who, _, a, b, at, _), img in zip(LINES, layers["bubbles"]):
+        b0, b1 = at, min(LOVE_AT, at + (b - a) + 0.35)
         if b0 <= t < b1:
             s = 0.6 + 0.4 * min(1, (t - b0) / 0.15)
             if who == "fish":
@@ -380,13 +384,17 @@ def make_audio(A, path):
     music = np.zeros(n)
     orig = decode_audio(A["cat_path"], 0, DUR)              # оригинальный звук УИИА
     music[: min(n, len(orig))] = orig[:n]
-    dialog = decode_audio(A["toad_path"])                   # оригинальные голоса из TikTok с жабой
     voice = np.zeros(n)
-    add(voice, dialog / (np.abs(dialog).max() + 1e-9), DIALOG_AT)
+    duck = np.ones(n)
+    for _, vid, a, b, at, _ in LINES:                      # родные голоса, фраза за фразой
+        line = decode_audio(fetch_tiktok(vid), a, b - a)
+        ramp = int(0.03 * SR)                               # без щелчков на стыках
+        line[:ramp] *= np.linspace(0, 1, ramp)
+        line[-ramp:] *= np.linspace(1, 0, ramp)
+        add(voice, line / (np.abs(line).max() + 1e-9), at)
+        duck[int((at - 0.1) * SR):int((at + b - a + 0.1) * SR)] = 0.25
     song = decode_audio(A["love_path"], LOVE_T0, LOVE_T1 - LOVE_T0)
     add(voice, 0.9 * song / (np.abs(song).max() + 1e-9), LOVE_AT)
-    duck = np.ones(n)
-    duck[int(DIALOG_AT * SR):int(DIALOG_AT * SR) + len(dialog)] = 0.28
     duck[int(LOVE_AT * SR):] = 0.12
     duck = np.convolve(duck, np.ones(4000) / 4000, mode="same")
     music *= 0.85 / (np.abs(music).max() + 1e-9)
@@ -421,7 +429,7 @@ def main():
         name=text_img("Mr Jabec", 32, fill=(140, 230, 90), stroke=5),
         love_cap=text_img(LOVE_CAPTION, 46, fill=(255, 150, 190)),
         heart=text_img("\u2764", 70, fill=(255, 60, 110), stroke=3, stroke_fill=(120, 0, 30)),
-        bubbles=[bubble_img(b[3], b[0] == "fish") for b in LINES],
+        bubbles=[bubble_img(b[5], b[0] == "fish") for b in LINES],
     )
     ff = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
