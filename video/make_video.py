@@ -1,7 +1,9 @@
-"""Коля (Mr Jabec) впервые видит её фронталку: УИИА-кот, рыба и жаба — 14 c, 720x1280.
+"""Коля (Mr Jabec) впервые видит её фронталку: УИИА-кот, рыба и жаба — ~18 c, 720x1280.
 
 Usage: python3 make_video.py <meme_grid.png> <out.mp4>
-Требует: ffmpeg, pip install numpy pillow opencv-python-headless "rembg[cpu]".
+Требует: ffmpeg, pip install numpy pillow opencv-python-headless "rembg[cpu]" coqui-tts,
+torch/torchaudio 2.8 (CPU). Новые реплики озвучиваются клоном родных голосов (XTTS v2,
+COQUI_TOS_AGREED=1).
 
 Всё берётся из оригиналов, 1 в 1:
   * кот и звук — TikTok «uia original cat» (green screen), фон вырезается rembg;
@@ -9,7 +11,9 @@ Usage: python3 make_video.py <meme_grid.png> <out.mp4>
   * диалог собран из фраз разных роликов 1loxxy родными голосами (см. LINES);
     голос Ларго отдан рыбе;
   * концовка — жаба поёт «Only a genius could love a woman» (1loxxy «Только Коля мог полюбить…»);
-  * её фронталка (на экране телефона) и рыба — из присланной картинки.
+  * новые реплики (say=...) — клон голосов Коли и Ларго из этих же роликов;
+  * её кадры на экране телефона (спит, фронталка, маска, холодильник, диван) и рыба —
+    из присланной картинки, меняются по сюжету.
 Видео качаются через tikwm.com; вырезки кэшируются в video/assets/.
 """
 import json
@@ -25,7 +29,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 W, H, FPS = 720, 1280, 30
-DUR = 14.2
+DUR = 18.0                # пересчитывается в build_schedule() по длине реплик
 SR = 44100
 FONT = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 SYMBOL_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"   # для ❤
@@ -42,8 +46,24 @@ BG_T = 1.3                          # кадр с пустой лесной тр
 CAT_TEXT_BOXES = [(190, 725, 386, 772),   # «Thank you.» поверх кота (в кадре 576x1024)
                   (60, 236, 215, 305)]    # водяной знак Vizard.ai
 GRID_FRONTALKA = (0, 1094, 541, 1448)
-SELFIE_BOX = (25, 38, 305, 300)     # внутри панели «фронталка»: её лицо без подписей
-FISH_BOX = (320, 30, 541, 300)
+FISH_BOX = (320, 30, 541, 300)      # рыба внутри панели «фронталка»
+# её кадры из присланной картинки: панель в сетке, кусок без подписей внутри неё, X её лица в куске
+SHOTS = {
+    "sleep": ((0, 0, 541, 254), (200, 40, 541, 185), 200),
+    "fridge": ((0, 257, 541, 524), (110, 45, 541, 185), 215),
+    "mask": ((0, 528, 541, 815), (15, 42, 285, 222), 160),
+    "frontalka": ((0, 1094, 541, 1448), (25, 45, 305, 300), 140),
+    "couch": ((546, 1094, 1086, 1448), (40, 40, 470, 295), 190),
+}
+PREVIEW = (300, 270)        # окно превью камеры на экране телефона
+FISH_TT = "7688388792935501063"     # 1loxxy: «Коля, ты что, не можешь говорить?» — голос Ларго
+SONG_TT = "7690632407040494856"     # 1loxxy: Коля поёт «Твої очі — ліхтарики…»
+# образцы голосов для клона: (ролик, начало, конец)
+VOICE_REFS = {
+    "toad": [(TOAD_TT, 0.0, 2.25), (TOAD_TT, 5.15, 5.75)],
+    "fish": [(TOAD_TT, 2.3, 4.65), (TOAD_TT, 6.25, 10.2), (FISH_TT, 0.0, 2.45), (FISH_TT, 3.2, 4.55)],
+}
+VOICE_SPEED = {"toad": 1.5, "fish": 1.2}
 
 
 def asset(name):
@@ -117,10 +137,23 @@ def cat_cutout(rgb):
     green = f[..., 1] - np.maximum(f[..., 0], f[..., 2])
     border = np.concatenate([green[:8].ravel(), green[-8:].ravel(), green[:, :8].ravel(), green[:, -8:].ravel()])
     if (border > 45).mean() < 0.95:
-        return cutout(rgb)
-    alpha = solid_alpha(green >= 70)     # дыры заливаются: размытый в движении кот отливает зелёным
+        rgba = cutout(rgb)
+        if not edges_opaque(rgba):
+            return rgba
+        # бледный однотонный фон rembg иногда берёт целиком — режем по цвету фона с краёв
+        edge = np.concatenate([f[:8].reshape(-1, 3), f[:, :8].reshape(-1, 3), f[:, -8:].reshape(-1, 3)])
+        dist = np.abs(f - np.median(edge, 0)).max(2)
+        return np.dstack([rgb, (solid_alpha(dist < 28) * 255).astype(np.uint8)])
+    # порог от зелёности краёв: на вспышках фон бледно-зелёный; дыры заливаются — размытый кот отливает зелёным
+    alpha = solid_alpha(green >= min(70, 0.6 * np.median(border)))
     g = np.minimum(f[..., 1], np.maximum(f[..., 0], f[..., 2]) + 8)       # без зелёного ореола
     return np.dstack([f[..., 0], g, f[..., 2], alpha * 255]).clip(0, 255).astype(np.uint8)
+
+
+def edges_opaque(rgba):
+    """Верх и бока кадра непрозрачные — значит, вырезка захватила фон."""
+    a = rgba[..., 3] > 128
+    return np.concatenate([a[:6].ravel(), a[:, :6].ravel(), a[:, -6:].ravel()]).mean() > 0.5
 
 
 def solid_alpha(bg_like):
@@ -194,21 +227,78 @@ def load_assets(grid_path):
     cat_path = fetch_tiktok(CAT_TT)
     toad_path = fetch_tiktok(TOAD_TT)
     print("cat frames...", flush=True)
-    cat = [to_sprite(f) for f in cached_sequence("cat", read_frames(cat_path, 0, DUR, FPS), cat_cutout)]
+    cat = []
+    for f in cached_sequence("cat", read_frames(cat_path, 0, DUR, FPS), cat_cutout):
+        # если вырезка всё же взяла фон целиком — кадр заменяем предыдущим
+        cat.append(cat[-1] if edges_opaque(f) and cat else to_sprite(f))
     print("toad frames...", flush=True)
     toad = [to_sprite(f)[0] for f in cached_sequence("toad", read_frames(toad_path, TOAD_T0, TOAD_T1, FPS))]
     love_path = fetch_tiktok(LOVE_TT)
     love = [Image.fromarray(f, "RGBA") for f in
             cached_sequence("love", read_frames(love_path, LOVE_T0, LOVE_T1, FPS), love_cutout)]
-    pan = Image.open(grid_path).convert("RGB").crop(GRID_FRONTALKA)
-    fish = cached_sequence("fish", [np.asarray(pan.crop(FISH_BOX))])[0]
+    grid = Image.open(grid_path).convert("RGB")
+    fish = cached_sequence("fish", [np.asarray(grid.crop(GRID_FRONTALKA).crop(FISH_BOX))])[0]
+    phones = {k: draw_phone(grid.crop(panel).crop(box), fx) for k, (panel, box, fx) in SHOTS.items()}
+    flash = Image.new("RGBA", phones[INTRO_SHOT].size, (255, 255, 255, 0))
+    flash.putalpha(phones[INTRO_SHOT].getchannel("A"))
     bg = make_background(toad_path).filter(ImageFilter.GaussianBlur(2.5))
     # чуть темнее и виньетка — персонажи выделяются, следы стирания не видны
     yy, xx = np.mgrid[0:H, 0:W]
     vig = 1 - 0.45 * (((xx - W / 2) / (W * 0.75)) ** 2 + ((yy - H / 2) / (H * 0.7)) ** 2)
     bg = Image.fromarray((np.asarray(bg) * (0.85 * vig.clip(0.4, 1))[..., None]).astype(np.uint8))
-    return dict(cat_path=cat_path, toad_path=toad_path, love_path=love_path, love=love, cat=cat, toad=toad, fish=to_sprite(fish)[0],
-                phone=draw_phone(pan.crop(SELFIE_BOX)), bg=bg)
+    return dict(cat_path=cat_path, toad_path=toad_path, love_path=love_path, love=love, cat=cat, toad=toad,
+                fish=to_sprite(fish)[0], phones=phones, phone_flash=flash, bg=bg)
+
+
+# --------------------------------------------------------------------------- голоса и расписание
+_XTTS = None
+
+
+def clone_line(text, who):
+    """Новая фраза голосом персонажа: XTTS v2 по образцам его родного голоса (с кэшем)."""
+    global _XTTS
+    import hashlib
+    speed = VOICE_SPEED[who]
+    path = asset(f"clone_{who}_{hashlib.md5(f'{text}|{speed}'.encode()).hexdigest()[:10]}.wav")
+    if not os.path.exists(path):
+        refs = []
+        for i, (vid, a, b) in enumerate(VOICE_REFS[who]):
+            ref = asset(f"ref_{who}_{i}.wav")
+            if not os.path.exists(ref):
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(a), "-t", str(b - a), "-i", fetch_tiktok(vid),
+                                "-ac", "1", "-ar", "24000", ref], check=True)
+            refs.append(ref)
+        if _XTTS is None:
+            os.environ.setdefault("COQUI_TOS_AGREED", "1")
+            from TTS.api import TTS
+            _XTTS = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
+        print(f"  voice {who}: {text}", flush=True)
+        _XTTS.tts_to_file(text=text, speaker_wav=refs, language="ru", speed=speed, file_path=path)
+    a = decode_audio(path)
+    loud = np.nonzero(np.abs(a) > 0.03 * np.abs(a).max())[0]   # срезаем тишину по краям
+    return a[max(0, loud[0] - int(0.05 * SR)):loud[-1] + int(0.08 * SR)]
+
+
+def build_schedule():
+    """Раскладывает реплики подряд по их реальной длине; задаёт LOVE_AT, TOAD_SYNC и DUR."""
+    global LOVE_AT, TOAD_SYNC, DUR
+    t = 0.0
+    for ln in LINES:
+        if "src" in ln:
+            vid, a, b = ln["src"]
+            audio = decode_audio(fetch_tiktok(vid), a, b - a)
+        else:
+            audio = clone_line(ln["say"], ln["who"])
+        ramp = int(0.03 * SR)                               # без щелчков на стыках
+        audio[:ramp] *= np.linspace(0, 1, ramp)
+        audio[-ramp:] *= np.linspace(1, 0, ramp)
+        ln["audio"] = audio / (np.abs(audio).max() + 1e-9)
+        ln["at"], ln["dur"] = t + ln["gap"], len(audio) / SR
+        t = ln["at"] + ln["dur"]
+        if ln.get("src", (None,))[0] == TOAD_TT:            # «Пять.» — кадры жабы 1 в 1 с голосом
+            TOAD_SYNC = ln["at"] - (ln["src"][1] - TOAD_T0)
+    LOVE_AT = t + 0.2
+    DUR = round(LOVE_AT + (LOVE_T1 - LOVE_T0) + 0.3, 2)
 
 
 # --------------------------------------------------------------------------- графика
@@ -237,8 +327,8 @@ def bubble_img(txt, tail_left=True, size=30):
     return im
 
 
-def draw_phone(selfie):
-    """Телефон с открытой фронталкой: статус-бар 04:00, квадратное превью, кнопка спуска."""
+def draw_phone(selfie, focus_x):
+    """Телефон с открытой фронталкой: статус-бар 04:00, превью её кадра, кнопка спуска."""
     sw, sh, bez = 300, 640, 14
     im = Image.new("RGBA", (sw + 2 * bez + 40, sh + 2 * bez + 40), (0, 0, 0, 0))
     glow = Image.new("L", im.size, 0)
@@ -256,8 +346,12 @@ def draw_phone(selfie):
     d.rounded_rectangle([sx + sw - 62, sy + 18, sx + sw - 28, sy + 34], radius=4, outline="white", width=2)
     d.rectangle([sx + sw - 59, sy + 21, sx + sw - 52, sy + 31], fill=(255, 70, 60))       # 5% заряда
     d.ellipse([sx + sw / 2 - 9, sy + 12, sx + sw / 2 + 9, sy + 30], fill=(10, 10, 14))      # фронтальная камера
-    prev = selfie.resize((sw, sw), Image.LANCZOS)
-    im.paste(prev, (sx, sy + 120))
+    pw, ph = PREVIEW                                          # кадр заполняет превью, лицо по центру
+    k = max(pw / selfie.width, ph / selfie.height)
+    big = selfie.resize((round(selfie.width * k), round(selfie.height * k)), Image.LANCZOS)
+    x = min(max(0, round(focus_x * k - pw / 2)), big.width - pw)
+    y = (big.height - ph) // 2
+    im.paste(big.crop((x, y, x + pw, y + ph)), (sx, sy + 270 - ph // 2))
     for i, (txt, col) in enumerate((("ВИДЕО", "white"), ("ФОТО", (255, 210, 40)), ("ПОРТРЕТ", "white"))):
         w = d.textlength(txt, font=f_mode)
         d.text((sx + sw / 2 + (i - 1) * 95 - w / 2, sy + 450), txt, font=f_mode, fill=col)
@@ -279,24 +373,40 @@ def paste_c(frame, img, cx, cy, scale=1.0, angle=0.0):
 
 
 CAPTION = "Коля впервые увидел\nеё фронталку"
-LOVE_AT = 10.6            # концовка: жаба поёт, «только гений мог полюбить такую, как она»
 LOVE_CAPTION = "Только гений мог полюбить\nтакую, как она"
-# диалог из фраз разных роликов 1loxxy (разметка whisper):
-# кто, id ролика, начало и конец фразы в нём, когда звучит у нас, пузырь
+INTRO_SHOT, LOVE_SHOT = "sleep", "couch"
+# Сюжет. src — родная фраза (ролик, начало, конец; разметка whisper), say — новая фраза клоном
+# того же голоса. gap — пауза перед репликой; shot — какой её кадр на телефоне (или (кадр, сдвиг)).
 LINES = [
-    ("fish", "7688388792935501063", 0.00, 2.45, 1.3, "Коля, ты что,\nне можешь говорить?"),
-    ("toad", TOAD_TT, 5.15, 5.75, 3.85, "пять."),
-    ("toad", "7690632407040494856", 4.20, 8.65, 4.6, "твои глаза — фонарики,\nвзгляд — пять звёзд, шок"),
-    ("fish", "7688388792935501063", 3.20, 4.55, 9.2, "Слава Богу!"),
+    dict(who="fish", src=(FISH_TT, 0.00, 2.45), gap=1.0, shot="frontalka",
+         bubble="Коля, ты что,\nне можешь говорить?"),
+    dict(who="toad", src=(TOAD_TT, 5.15, 5.75), gap=0.12, bubble="пять."),
+    dict(who="toad", src=(SONG_TT, 4.20, 8.65), gap=0.1, shot=("mask", 2.4),
+         bubble="твої очі — ліхтарики,\nпогляд — п’ять зірок, шок"),
+    dict(who="fish", src=(FISH_TT, 3.20, 4.55), gap=0.1, bubble="Слава Богу!"),
+    dict(who="fish", say="Коля, она ночью съела весь торт.", gap=0.25, shot="fridge",
+         bubble="Коля, она ночью\nсъела весь торт"),
+    dict(who="toad", say="Ква! Значит, это любовь!", gap=0.15, bubble="ква! значит, это любовь"),
 ]
-TOAD_SYNC = 3.85 - (5.15 - TOAD_T0)   # кадры жабы 1 в 1 с её «Пять.»
+LOVE_AT = TOAD_SYNC = 0.0   # считаются в build_schedule()
 PHONE_C = (360, 520)
 FISH_C = (160, 1010)
 TOAD_C = (545, 990)
 
 
 def speaking(t, who):
-    return any(w == who and at <= t < at + (b - a) for w, _, a, b, at, _ in LINES)
+    return any(ln["who"] == who and ln["at"] <= t < ln["at"] + ln["dur"] for ln in LINES)
+
+
+def current_shot(t):
+    """(кадр на телефоне, когда он включился)."""
+    shot, since = INTRO_SHOT, 0.0
+    for ln in LINES:
+        if "shot" in ln:
+            key, off = ln["shot"] if isinstance(ln["shot"], tuple) else (ln["shot"], 0.0)
+            if t >= ln["at"] + off:
+                shot, since = key, ln["at"] + off
+    return (LOVE_SHOT, LOVE_AT) if t >= LOVE_AT else (shot, since)
 
 
 def render(fi, A, pulse, voice_env, layers):
@@ -318,7 +428,11 @@ def render(fi, A, pulse, voice_env, layers):
     cat_pos = (cx + (cat_img.width / 2 - ox) * cs, cy + (cat_img.height / 2 - oy) * cs)
     if depth < 0:
         paste_c(frame, cat_img, *cat_pos, cs)
-    paste_c(frame, A["phone"], PHONE_C[0], PHONE_C[1] + 6 * math.sin(t * 2.2), 0.82 * (1 + 0.03 * bp),
+    shot, since = current_shot(t)
+    phone = A["phones"][shot]
+    if t - since < 0.25 and since > 0:                      # вспышка камеры при смене кадра
+        phone = Image.blend(phone, A["phone_flash"], 0.85 * (1 - (t - since) / 0.25))
+    paste_c(frame, phone, PHONE_C[0], PHONE_C[1] + 6 * math.sin(t * 2.2), 0.82 * (1 + 0.03 * bp),
             3 * math.sin(t * 1.7))
     if depth >= 0:
         paste_c(frame, cat_img, *cat_pos, cs)
@@ -350,8 +464,8 @@ def render(fi, A, pulse, voice_env, layers):
         frame.alpha_composite(A["love"][min(len(A["love"]) - 1, int(lt * FPS))].resize((W, H), Image.BILINEAR),
                               (0, round(rise)))
 
-    for (who, _, a, b, at, _), img in zip(LINES, layers["bubbles"]):
-        b0, b1 = at, min(LOVE_AT, at + (b - a) + 0.35)
+    for ln, img in zip(LINES, layers["bubbles"]):
+        who, b0, b1 = ln["who"], ln["at"], min(LOVE_AT, ln["at"] + ln["dur"] + 0.35)
         if b0 <= t < b1:
             s = 0.6 + 0.4 * min(1, (t - b0) / 0.15)
             if who == "fish":
@@ -386,13 +500,9 @@ def make_audio(A, path):
     music[: min(n, len(orig))] = orig[:n]
     voice = np.zeros(n)
     duck = np.ones(n)
-    for _, vid, a, b, at, _ in LINES:                      # родные голоса, фраза за фразой
-        line = decode_audio(fetch_tiktok(vid), a, b - a)
-        ramp = int(0.03 * SR)                               # без щелчков на стыках
-        line[:ramp] *= np.linspace(0, 1, ramp)
-        line[-ramp:] *= np.linspace(1, 0, ramp)
-        add(voice, line / (np.abs(line).max() + 1e-9), at)
-        duck[int((at - 0.1) * SR):int((at + b - a + 0.1) * SR)] = 0.25
+    for ln in LINES:                                       # голоса, фраза за фразой
+        add(voice, ln["audio"], ln["at"])
+        duck[int((ln["at"] - 0.1) * SR):int((ln["at"] + ln["dur"] + 0.1) * SR)] = 0.25
     song = decode_audio(A["love_path"], LOVE_T0, LOVE_T1 - LOVE_T0)
     add(voice, 0.9 * song / (np.abs(song).max() + 1e-9), LOVE_AT)
     duck[int(LOVE_AT * SR):] = 0.12
@@ -421,6 +531,7 @@ def make_audio(A, path):
 
 def main():
     grid, out = sys.argv[1], sys.argv[2]
+    build_schedule()
     A = load_assets(grid)
     wav = out.rsplit(".", 1)[0] + "_audio.wav"
     pulse, voice_env = make_audio(A, wav)
@@ -429,7 +540,7 @@ def main():
         name=text_img("Mr Jabec", 32, fill=(140, 230, 90), stroke=5),
         love_cap=text_img(LOVE_CAPTION, 46, fill=(255, 150, 190)),
         heart=text_img("\u2764", 70, fill=(255, 60, 110), stroke=3, stroke_fill=(120, 0, 30)),
-        bubbles=[bubble_img(b[5], b[0] == "fish") for b in LINES],
+        bubbles=[bubble_img(ln["bubble"], ln["who"] == "fish") for ln in LINES],
     )
     ff = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}",
