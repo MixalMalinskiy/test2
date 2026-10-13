@@ -364,7 +364,7 @@ def build_schedule():
 
 # --------------------------------------------------------------------------- графика
 def text_img(txt, size, fill=(255, 225, 40), stroke=6, stroke_fill=(10, 10, 10)):
-    f = ImageFont.truetype(SYMBOL_FONT if txt == "\u2764" else FONT, size)
+    f = ImageFont.truetype(SYMBOL_FONT if len(txt) == 1 and not txt.isalnum() else FONT, size)   # ❤ ★
     bb = [int(round(v)) for v in ImageDraw.Draw(Image.new("RGBA", (1, 1))).multiline_textbbox(
         (0, 0), txt, font=f, stroke_width=stroke, align="center", spacing=6)]
     im = Image.new("RGBA", (bb[2] - bb[0] + 8, bb[3] - bb[1] + 8), (0, 0, 0, 0))
