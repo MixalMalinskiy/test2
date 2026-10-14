@@ -1,9 +1,12 @@
 """«Китык знакомится» — длинный плюшевый кот рассказывает о себе голосом Коли (Mr Jabec), ~25 c.
 
 Usage: python3 kityk_story.py <out.mp4>
-Голос: F5-TTS (русская модель) озвучивает фразу по образцу родного голоса Коли, затем
-Seed-VC (github.com/Plachtaa/seed-vc, путь — SEED_VC_DIR, по умолчанию /root/seed-vc)
-перекрашивает её по самой длинной родной фразе Коли; из двух прогонов берём более похожий (ECAPA).
+Голос Коли — банк его родной речи (~30 c, 12 фраз), вытащенный из YouTube-роликов 1loxxy
+(«Жаби Коля Лучшее за Март 2026», «Коля читает новости») через vidIQ и отобранный по голосу
+(ECAPA): video/assets/kolya_bank/*.wav, kolya_bank.wav и kolya_f5ref_news.wav.
+Каждая фраза: 3 дубля F5-TTS по образцу «новостей» + перекраска лучшего Seed-VC
+(github.com/Plachtaa/seed-vc, путь SEED_VC_DIR) по всему банку; побеждает вариант,
+ближе всего к среднему голосу Коли и разборчивее всего (whisper).
 Фото Китыка — kityk_photos/, УИИА-кот и его звук — из make_video.py.
 """
 import hashlib
@@ -21,9 +24,12 @@ import make_video as mv
 
 W, H, FPS, SR = mv.W, mv.H, mv.FPS, mv.SR
 SEED_VC_DIR = os.environ.get("SEED_VC_DIR", "/root/seed-vc")
-KOLYA_MAIN = (mv.TOAD_TT, 0.0, 2.25)       # «А что если они не захотят скидываться?» — образец для Seed-VC
-VC_TAKES = 2
-mv.CLONE_TAKES = 2                          # дублей F5 на фразу (дальше ещё Seed-VC)
+KOLYA_BANK_DIR = mv.asset("kolya_bank")        # 12 родных фраз Коли
+KOLYA_BANK = mv.asset("kolya_bank.wav")         # они же подряд, ~30 c — образец для Seed-VC
+KOLYA_F5_REF = (mv.asset("kolya_f5ref_news.wav"),
+                "С+амая гл+авная н+овость. Ам+ерика посс+орилась с С+ирией. "
+                "И не т+олько с С+ирией. Он+а посс+орилась с Л+ивией, Ир+аном.")
+F5_TAKES = 3
 CAT_SPIN_SRC = (2.8, 4.45)                 # кусок оригинала, где кот крутится (и звук)
 KITYK_SPIN_SRC = (6.25, 9.2)               # звук УИИА, под который крутится Китык
 
@@ -42,36 +48,48 @@ LABELS = {"pan": "длина: 1 метр", "turn": "вид сзади", "sleep":
 
 
 # --------------------------------------------------------------------------- голос
+def kolya_center():
+    """Средний голос Коли по его родным фразам (вектор ECAPA)."""
+    vecs = [mv.speaker_vec(os.path.join(KOLYA_BANK_DIR, f)) for f in sorted(os.listdir(KOLYA_BANK_DIR))]
+    c = np.mean(vecs, 0)
+    return c / np.linalg.norm(c)
+
+
 def kolya_voice(text):
-    """F5 (по образцу Коли) → Seed-VC (по его главной фразе); лучший из VC_TAKES по похожести."""
-    path = mv.asset(f"kityk_voice_{hashlib.md5(text.encode()).hexdigest()[:10]}.wav")
+    """Лучший из: F5_TAKES дублей F5 и перекраски лучшего дубля Seed-VC — по похожести на Колю + разборчивости."""
+    import difflib
+    path = mv.asset(f"kityk_voice2_{hashlib.md5(text.encode()).hexdigest()[:10]}.wav")
     if not os.path.exists(path):
-        target = mv.asset("kolya_main.wav")
-        if not os.path.exists(target):
-            vid, a, b = KOLYA_MAIN
-            subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(a), "-t", str(b - a), "-i", mv.fetch_tiktok(vid),
-                            "-ac", "1", "-ar", "22050", target], check=True)
-        src = path.replace(".wav", "_f5.wav")
-        with wave.open(src, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(SR)
-            w.writeframes((mv.clone_line(text, "toad") * 32767 * 0.95).astype(np.int16).tobytes())
-        want = mv.speaker_vec(target)
-        best = None
-        for take in range(VC_TAKES):
-            out_dir = path.replace(".wav", f"_vc{take}")
-            os.makedirs(out_dir, exist_ok=True)
-            print(f"  seed-vc #{take}: {text}", flush=True)
-            subprocess.run([sys.executable, "inference.py", "--source", src, "--target", target, "--output", out_dir,
-                            "--diffusion-steps", "50", "--inference-cfg-rate", "0.7", "--fp16", "False"],
-                           cwd=SEED_VC_DIR, check=True, capture_output=True)
-            res = [os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith(".wav")][0]
-            sim = float(mv.speaker_vec(res) @ want)
-            print(f"    похожесть на Колю {sim:.2f}", flush=True)
-            if best is None or sim > best[0]:
-                best = (sim, res)
-        os.replace(best[1], path)
+        m = mv.voice_models()
+        center = kolya_center()
+        norm = lambda x: "".join(c for c in x.lower().replace("ё", "е") if c.isalnum())  # noqa: E731
+
+        def score(wav):
+            heard = " ".join(seg.text for seg in m["whisper"].transcribe(mv.pcm16k(wav), language="ru")[0])
+            sim = float(mv.speaker_vec(wav) @ center)
+            clarity = difflib.SequenceMatcher(None, norm(text), norm(heard)).ratio()
+            print(f"    похожесть на Колю {sim:.2f}, разборчивость {clarity:.2f}: «{heard.strip()}»", flush=True)
+            return sim + 0.5 * clarity, sim
+
+        cands = []
+        for take in range(F5_TAKES):
+            tmp = path.replace(".wav", f"_f5_{take}.wav")
+            print(f"  F5 #{take}: {text}", flush=True)
+            m["f5"].infer(ref_file=KOLYA_F5_REF[0], ref_text=KOLYA_F5_REF[1], gen_text=text, file_wave=tmp,
+                          nfe_step=32, seed=take, show_info=lambda *a, **k: None)
+            cands.append((*score(tmp), tmp))
+        best_f5 = max(cands)[2]
+        out_dir = path.replace(".wav", "_vc")
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"  Seed-VC: {text}", flush=True)
+        subprocess.run([sys.executable, "inference.py", "--source", best_f5, "--target", KOLYA_BANK, "--output", out_dir,
+                        "--diffusion-steps", "50", "--inference-cfg-rate", "0.7", "--fp16", "False"],
+                       cwd=SEED_VC_DIR, check=True, capture_output=True)
+        vc = [os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith(".wav")][0]
+        cands.append((*score(vc), vc))
+        best = max(cands)
+        print(f"  выбран: похожесть {best[1]:.2f} ({os.path.basename(best[2])})", flush=True)
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", best[2], "-ac", "1", "-ar", str(SR), path], check=True)
     a = mv.decode_audio(path)
     loud = np.nonzero(np.abs(a) > 0.03 * np.abs(a).max())[0]
     a = a[max(0, loud[0] - int(0.05 * SR)):loud[-1] + int(0.08 * SR)]
